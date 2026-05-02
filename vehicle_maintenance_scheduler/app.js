@@ -31,6 +31,10 @@ app.use(async (error, req, res, _next) => {
 
 if (require.main === module) {
   app.listen(port, () => {
+    process.stdout.write(
+      `Vehicle maintenance scheduler listening on http://localhost:${port}\n`
+    );
+
     void logger.info(
       'handler',
       `Scheduler started port=${port}`

@@ -330,4 +330,145 @@ INSERT INTO notifications (id, studentId, notificationType, title, message, isRe
 VALUES 
   ('notif-uuid-001', '1042', 'Placement', 'Campus Placement Drive', 'Google is visiting.', false, NOW()),
   ('notif-uuid-002', '1043', 'Placement', 'Campus Placement Drive', 'Google is visiting.', false, NOW());
+
+---
+
+# Stage 3 — Query Optimization
+
+## Query Analysis
+
+The given query:
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+**What it does:**
+- Fetches all unread notifications for student ID 1042
+- Sorts by creation timestamp descending (newest first)
+- Returns ALL matching rows (no pagination)
+
+**Correctness issue:**
+- Uses `studentID` (camelCase) but schema uses `studentId` — would cause column error
+- Missing LIMIT — returns unbounded results (performance bug)
+- Uses `SELECT *` — fetches unnecessary columns
+
+---
+
+## Why It Is Slow
+
+**Time Complexity: O(n log n)**
+
+Where n = total rows in table (not just matching rows).
+
+### Breakdown:
+
+| Operation | Cost | Explanation |
+|-----------|------|-------------|
+| Filtering | O(n) | Without proper index on `studentId + isRead`, DB must scan ALL rows |
+| Sorting | O(n log n) | Must sort entire result set in memory/disk |
+| Table Lookup | O(n) | SELECT * requires fetching all columns from table pages |
+
+### At scale (10M+ rows):
+- Full table scan: 10M row accesses
+- In-memory sort: Expensive for large result sets
+- I/O: Multiple disk seeks for table pages
+
+**Estimated latency:** 500ms-2000ms depending on data volume.
+
+---
+
+## Index Evaluation
+
+### "Add indexes on every column" — This is BAD
+
+**Why it's bad:**
+
+| Problem | Impact |
+|---------|--------|
+| Write Overhead | INSERT/UPDATE must update ALL indexes — 5x slower writes |
+| Storage Bloat | Each index replicates B-tree; disk usage 5x-10x table size |
+| Memory Pressure | Index pages compete with table data in buffer pool |
+| Diminishing Returns | Many indexes never used by queries |
+
+### Optimal Index Design
+
+**Composite index required:**
+
+```sql
+CREATE INDEX idx_notifications_student_isread_created 
+ON notifications (studentId, isRead, createdAt DESC);
+```
+
+**Column order explained:**
+
+| Position | Column | Why |
+|----------|--------|-----|
+| 1st | studentId | = equality filter — narrows dataset fastest |
+| 2nd | isRead | = equality filter — further narrows |
+| 3rd | createdAt DESC | ORDER BY matches — avoids sort |
+
+**Query will use index only if:**
+- SELECT specific columns (not SELECT *)
+- Add LIMIT
+
+---
+
+## Optimized Solution
+
+### Improved Query:
+
+```sql
+SELECT id, notificationType, title, message, isRead, createdAt
+FROM notifications
+WHERE studentId = '1042' AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+
+### With Index:
+
+```sql
+CREATE INDEX idx_notifications_student_isread_created 
+ON notifications (studentId, isRead, createdAt DESC);
+```
+
+### Performance Improvement:
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Scan | Full table (O(n)) | Index range (O(log n + k)) |
+| Sort | O(n log n) | Already sorted in index |
+| I/O | Many page reads | Few index leaf pages |
+
+**Time Complexity: O(log n + k)** where k = result size (20)
+
+---
+
+## New Query
+
+**Find all students who received "Placement" notifications in the last 7 days:**
+
+```sql
+SELECT DISTINCT studentId
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+**Optimized with index:**
+
+```sql
+CREATE INDEX idx_notifications_type_created 
+ON notifications (notificationType, createdAt DESC);
+```
+
+**Execution Plan:**
+1. Index scan on `(notificationType, createdAt)`
+2. Filter by date range (7 days)
+3. DISTINCT aggregation on studentId
+
+**Time Complexity: O(m log m)** where m = matching rows
 ```
