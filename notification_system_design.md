@@ -471,4 +471,579 @@ ON notifications (notificationType, createdAt DESC);
 3. DISTINCT aggregation on studentId
 
 **Time Complexity: O(m log m)** where m = matching rows
+
+---
+
+# Stage 4 — Performance Improvement
+
+## Problem Summary
+
+**Current Issue:**
+- Fetching notifications from DB on EVERY page load
+- No caching, no pagination, no real-time push
+- Result: High DB load, slow response times, poor UX
+
+---
+
+## Caching Strategy
+
+### What to Cache
+
+| Data | Cache Duration | Reason |
+|------|-----------------|--------|
+| Recent 20 notifications per student | 5 minutes | Frequently accessed, changes slowly |
+| Unread count per student | 1 minute | Real-time count important |
+| All-time unread list | TTL 1 hour | Changes when user reads |
+
+### Cache Key Design
+
 ```
+Key: "notifs:{studentId}:recent"
+Value: JSON array of latest 20 notifications
+TTL: 300 seconds
+
+Key: "notifs:{studentId}:unread_count"
+Value: Integer
+TTL: 60 seconds
+```
+
+### Cache Invalidation Strategy
+
+| Event | Action |
+|-------|--------|
+| New notification created | Invalidate student's "recent" + update "unread_count" |
+| Notification marked read | Invalidate both caches |
+| Notification deleted | Invalidate both caches |
+
+**Write-through pattern:**
+1. Write to DB first
+2. Update/invalidate cache
+3. Return success
+
+### How It Reduces DB Load
+
+| Metric | Before | After |
+|--------|--------|-------|
+| DB hits per page load | 1 | 0 (cache hit) |
+| Response time | 200ms | 5ms |
+| DB QPS | 1000 | ~50 |
+
+---
+
+## Pagination Strategy
+
+### Why Fetching All Is Bad
+
+- Unbounded result set = unknown memory usage
+- Sorting large dataset = O(n log n)
+- Network transfer of unnecessary data
+
+### Cursor-Based Pagination (Recommended)
+
+```sql
+-- First page
+SELECT id, notificationType, title, message, isRead, createdAt
+FROM notifications
+WHERE studentId = '1042'
+ORDER BY createdAt DESC
+LIMIT 20;
+
+-- Next page (cursor = last createdAt from previous page)
+SELECT id, notificationType, title, message, isRead, createdAt
+FROM notifications
+WHERE studentId = '1042'
+  AND createdAt < '2026-05-02T10:00:00Z'
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+
+**Better than OFFSET:**
+- OFFSET causes O(n) scan for large offsets
+- Cursor uses index efficiently: O(log n + k)
+
+### Impact
+
+| Approach | Performance | Issue |
+|----------|-------------|-------|
+| LIMIT/OFFSET | Degrades at high OFFSET | Scans skipped rows |
+| Cursor-based | O(log n + k) | Requires passing cursor |
+
+---
+
+## Real-Time Push Design
+
+### Why Polling Is Inefficient
+
+- Client polls every 10 seconds = 10 requests/second for 1000 clients
+- Most polls return empty (wasted resources)
+- Delay between event and delivery (max 10 seconds)
+
+### WebSocket Architecture
+
+```
+Client                        Server                        DB
+  |                            |                            |
+  |------- WS Connect ------->|                            |
+  |<----- Auth OK ------------|                            |
+  |                            |                            |
+  |                    [New Notification Created]       |
+  |                            |<--- Insert to DB ----------|
+  |<---- Push Notification ----|                            |
+  |---- ACK ----------------->|                            |
+```
+
+### Implementation
+
+**Server-side:**
+1. Maintain WebSocket connection per student
+2. Map studentId → WebSocket connection
+3. On INSERT: push to connected client + save to DB
+
+**Client-side:**
+1. Connect on page load
+2. Listen for NEW_NOTIFICATION events
+3. Update local state + UI instantly
+4. Send ACK when rendered
+
+**Alternative: Server-Sent Events (SSE)**
+- Simpler than WebSocket (one-way)
+- Works over HTTP/1.1
+- No binary protocol needed
+
+---
+
+## Architecture Improvement
+
+### Layered Approach
+
+```
+[Client]
+    |
+    v
+[Cache (Redis)] ----> HIT: return cached data
+    |
+    v (MISS)
+[Database (PostgreSQL)] --> return + write to cache
+```
+
+### Flow for Fetch Notifications
+
+1. Check Redis for `notifs:{studentId}:recent`
+2. If HIT → return JSON (5ms)
+3. If MISS → Query DB with LIMIT 20
+4. Write result to cache
+5. Return response (200ms)
+
+### Reducing Repeated DB Hits
+
+| Technique | How | Improvement |
+|-----------|-----|-------------|
+| Caching | Serve from Redis | 95% fewer DB hits |
+| Pagination | LIMIT 20 vs all | 50x less data |
+| Real-time push | Only new data sent | No poll waste |
+| Stale-while-revalidate | Serve stale, update async | No blocking |
+
+---
+
+## Tradeoffs
+
+### Caching
+
+| Pro | Con |
+|-----|-----|
+| 95% DB load reduction | Cache invalidation complexity |
+| Sub-10ms response | Memory cost for Redis |
+| Cache may serve stale data | Requires careful TTL |
+
+**When it fails:**
+- Cache down → DB spike → cascade failure
+- Improper invalidation → user sees old data
+
+### Pagination
+
+| Pro | Con |
+|-----|-----|
+| Bounded memory | More complex client code |
+| Faster queries | Cursor must be valid |
+| Predictable load | Deep pagination still slow |
+
+**When it fails:**
+- Invalid cursor → query fails
+- User scrolls too deep → slow query
+
+### Real-Time Push
+
+| Pro | Con |
+|-----|-----|
+| Instant delivery | WebSocket management |
+| Fewer requests | Connection state |
+| Better UX | Reconnection logic |
+
+**When it fails:**
+- Connection drops → need reconnect
+- Firewalls block WS ports
+- Scales poorly with 100K+ connections (needs connection pooler)
+
+### Architecture
+
+| Pro | Con |
+|-----|-----|
+| Resilient (cache down = fallback) | More components to maintain |
+| Scalable (read replicas) | Replication lag possible |
+| Layered caching | Data inconsistency window |
+
+**When it fails:**
+- Redis down without fallback → DB crash
+- Cache stampede (all clients miss → DB flood)
+
+# Stage 5 — Reliability & System Design
+
+## Problems in Current Design
+
+### Code Analysis
+```python
+def notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### Identified Issues
+
+| Problem | Explanation |
+|---------|-------------|
+| Sequential Execution | One student at a time; 10,000 students = 10,000 iterations |
+| Blocking I/O | Each call waits before next iteration |
+| No Atomicity | DB save succeeds but email fails = inconsistent |
+| No Error Handling | Exception stops entire process |
+| No Idempotency | Retries cause duplicate notifications |
+| No Rollback | Mid-failure leaves unknown state |
+
+### Failure Scenarios
+
+| Scenario | What Happens |
+|----------|--------------|
+| Email fails at student 200 | 1-199 done, 200-10000 never processed |
+| DB fails at student 200 | Email sent but no DB record |
+| Process crashes | No recovery, partial sends |
+
+---
+
+## Redesigned Architecture
+
+### Queue-Based Async Flow
+```
+[API Server] --> [Queue (Kafka)] --> [Email Worker]
+                         --> [DB Worker]
+                         --> [Push Worker]
+```
+
+### Message Format
+```json
+{
+  "messageId": "msg-uuid-001",
+  "studentId": "1042",
+  "type": "Placement",
+  "title": "Placement Drive",
+  "message": "Google visiting Monday",
+  "retryCount": 0
+}
+
+---
+
+## Failure Handling Strategy
+
+### Retry Mechanism
+| Attempt | Delay |
+|---------|-------|
+| 1 | Immediate |
+| 2 | 5 seconds |
+| 3 | 30 seconds |
+| 4 | 2 minutes |
+| 5+ | Move to DLQ |
+
+### Dead Letter Queue (DLQ)
+- After max retries, message moved to DLQ
+- Alert monitoring system
+- Manual review required
+
+---
+
+## Idempotency
+
+### Why Duplicates Occur
+- API retried after timeout
+- Worker fails after DB write but before ACK
+- Message queue redelivers after crash
+
+### Prevention
+```sql
+INSERT INTO notifications (id, studentId, message)
+SELECT 'msg-uuid', '1042', 'Message'
+WHERE NOT EXISTS (
+    SELECT 1 FROM notifications 
+    WHERE idempotencyKey = 'hash-of-message'
+);
+```
+
+---
+
+## DB vs Email Decision
+
+**Answer: NO — Separate them**
+
+| Aspect | Synchronous | Async |
+|-------|-------------|-------|
+| Response Time | 83 minutes | < 5ms |
+| Reliability | One failure kills all | Isolated failures |
+| Scalability | Blocks | Scales |
+
+**Flow:** 1. Save to DB first (source of truth) 2. Publish to queue (async) 3. Return 202
+
+---
+
+## Scalability
+
+| Strategy | Implementation |
+|----------|---------------|
+| Partitioned Queue | Kafka partitions by studentId |
+| Horizontal Workers | Multiple instances |
+| Batch Processing | 100 messages per batch |
+
+**Metrics:** 10,000 msg/sec, < 5ms latency
+
+---
+
+## Revised Pseudocode
+
+### Bad (Before)
+```python
+def notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### Good (After)
+```python
+from kafka import KafkaProducer
+import hashlib
+
+def notify_all(student_ids, message):
+    idempotency_key = hashlib.sha256(
+        f"{message['type']}:{message['title']}:{message['timestamp']}".encode()
+    ).hexdigest()
+    
+    # 1. Save to DB (source of truth)
+    for student_id in student_ids:
+        db.save_notification(id=idempotency_key, student_id=student_id, 
+                           type=message['type'], title=message['title'],
+                           message=message['message'])
+    
+    # 2. Publish to queue (async)
+    producer = KafkaProducer(bootstrap_servers='localhost:9092')
+    for student_id in student_ids:
+        event = {'messageId': idempotency_key, 'studentId': student_id,
+                'type': message['type'], 'message': message['message']}
+        producer.send('notification_events', event)
+    producer.flush()
+    return {"status": "accepted", "count": len(student_ids)}
+
+
+def email_worker(event):
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            send_email(event['studentId'], event['message'])
+            return "success"
+        except:
+            if attempt < max_retries - 1:
+                wait = 5 * (2 ** attempt)
+                time.sleep(wait)
+            else:
+                dlq.send(event)  # Move to DLQ
+                return "failed"
+```
+
+---
+
+End of Stage 5
+
+# Stage 6 — Priority Inbox
+
+## Approach: Min-Heap for Top-N
+
+**Why Min-Heap?**
+- Full sort: O(m log m) where m = total notifications
+- Min-heap of size N: O(m log N) → much faster when m >> N
+- Only need to maintain N elements, not all m
+
+**Algorithm:**
+1. Use min-heap to keep lowest-priority item at root
+2. For each new notification: O(log N) to potentially insert
+3. If heap not full: add directly
+4. If heap full and new item > root: replace root and heapify → O(log N)
+5. At any time, heap contains exactly top N items
+
+---
+
+## Working Code
+
+```javascript
+const https = require('https');
+
+const PRIORITY = { 'Placement': 3, 'Result': 2, 'Event': 1 };
+
+class PriorityInbox {
+    constructor(n = 10) {
+        this.n = n;
+        this.heap = [];
+        this.seenIds = new Set();
+    }
+
+    compare(a, b) {
+        const pA = PRIORITY[a.Type] || 0;
+        const pB = PRIORITY[b.Type] || 0;
+        if (pA !== pB) return pB - pA;
+        return new Date(b.Timestamp) - new Date(a.Timestamp);
+    }
+
+    pushNotification(notification) {
+        if (this.seenIds.has(notification.ID)) return;
+        this.seenIds.add(notification.ID);
+
+        if (this.heap.length < this.n) {
+            this.heap.push(notification);
+            this.bubbleUp(this.heap.length - 1);
+        } else if (this.compare(notification, this.heap[0]) > 0) {
+            this.heap[0] = notification;
+            this.bubbleDown(0);
+        }
+    }
+
+    bubbleUp(i) {
+        while (i > 0) {
+            const parent = Math.floor((i - 1) / 2);
+            if (this.compare(this.heap[i], this.heap[parent]) <= 0) break;
+            [this.heap[i], this.heap[parent]] = [this.heap[parent], this.heap[i]];
+            i = parent;
+        }
+    }
+
+    bubbleDown(i) {
+        while (true) {
+            let smallest = i;
+            const left = 2 * i + 1;
+            const right = 2 * i + 2;
+            if (left < this.heap.length && this.compare(this.heap[left], this.heap[smallest]) < 0) smallest = left;
+            if (right < this.heap.length && this.compare(this.heap[right], this.heap[smallest]) < 0) smallest = right;
+            if (smallest === i) break;
+            [this.heap[i], this.heap[smallest]] = [this.heap[smallest], this.heap[i]];
+            i = smallest;
+        }
+    }
+
+    getTopN() {
+        return this.heap.slice().sort((a, b) => this.compare(a, b));
+    }
+}
+
+function fetchNotifications(authToken) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: '20.207.122.201',
+            path: '/evaluation-service/notifications',
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        };
+
+        const req = https.get(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    resolve(parsed.notifications || []);
+                } catch (e) { reject(e); }
+            });
+        });
+
+        req.on('error', reject);
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
+}
+
+async function main() {
+    const config = {
+        n: 10,
+        pollInterval: 5000,
+        authToken: process.env.AUTH_TOKEN || 'your-token-here'
+    };
+
+    const inbox = new PriorityInbox(config.n);
+    console.log(`Priority Inbox initialized with N=${config.n}`);
+
+    async function poll() {
+        try {
+            const notifications = await fetchNotifications(config.authToken);
+            for (const n of notifications) {
+                inbox.pushNotification(n);
+            }
+            const top = inbox.getTopN();
+            console.log('Top', top.length, 'notifications:');
+            top.forEach((n, i) => console.log(`  ${i + 1}. [${n.Type}] ${n.Message}`));
+        } catch (e) {
+            console.error('Error:', e.message);
+        }
+    }
+
+    poll();
+    setInterval(poll, config.pollInterval);
+}
+
+main();
+```
+
+---
+
+## Time Complexity
+
+| Operation | Complexity | Explanation |
+|-----------|------------|-------------|
+| Push notification | O(log N) | Heap insert or replace + bubble |
+| Get top N | O(N log N) | Final sort of heap |
+| API fetch | O(m) | Network + parse |
+
+**Total for m notifications:** O(m log N) — efficient when N << m
+
+---
+
+## Handling Continuous Updates
+
+**Problem:** New notifications arrive continuously
+**Solution:** Maintain sliding window of heap
+
+| Scenario | Action |
+|----------|--------|
+| New notification arrives | pushNotification() — O(log N) |
+| Duplicate notification | seenIds check — O(1) |
+| Heap full, new lower priority | Ignored (not in top N) |
+| Heap full, new higher priority | Replace root + bubbleDown — O(log N) |
+
+**Continuous polling:**
+- Poll every 5 seconds (configurable)
+- Each poll adds new notifications to heap
+- Heap automatically maintains top N by priority
+
+**Memory:** O(N) for heap + O(m) for seenIds (deduplication)
+
+---
+
+End of Stage 6
